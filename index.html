@@ -1,0 +1,144 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TensegrityReplayFetcher Prototype</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#fff8f0;color:#222;margin:20px}
+header{margin-bottom:12px}
+textarea{width:100%;height:120px}
+.out{white-space:pre-wrap;background:#f6f6f6;padding:8px;border:1px solid #eee}
+button{margin-top:6px}
+.file-list{margin-top:8px}
+.warn{color:#a63}
+.ok{color:#196}
+</style>
+</head>
+<body>
+<header>
+<h2>TensegrityReplayFetcher — prototype</h2>
+<p>Upload CSV/JSON files or a ZIP of such files. The page will attempt to find per-module time-series, normalize timestamps to ISO-8601 UTC, perform simple checks, and produce canonical JSON blobs for download.</p>
+</header>
+<input id="files" type="file" multiple />
+<button id="run">Process</button>
+<div class="file-list" id="fileList"></div>
+<h3>Output</h3>
+<div id="output" class="out"></div>
+<script>
+// Minimal utilities
+function isoUTC(date){ return new Date(date).toISOString(); }
+function isNumeric(n){ return typeof n === 'number' && isFinite(n); }
+function parseCSV(text){
+  const lines = text.replace(/\r/g,'').split('\n').filter(l=>l.trim());
+  const header = lines.shift().split(',').map(h=>h.trim());
+  return lines.map(l=>{
+    const vals = l.split(','); const obj = {};
+    header.forEach((h,i)=>{ const v=vals[i]??''; const n=Number(v); obj[h]=v!==''&&!Number.isNaN(n)?n:v; });
+    return obj;
+  });
+}
+function detectTimeField(rows){
+  if(!rows.length) return null;
+  const keys = Object.keys(rows[0]);
+  // prefer fields named time, timestamp, t
+  for(const k of keys){ if(/^(time|timestamp|t)$/i.test(k)) return k; }
+  // numeric field that increases monotonically
+  for(const k of keys){ if(rows.every(r=>typeof r[k]==='number')){
+    let ok=true; for(let i=1;i<rows.length;i++) if(rows[i][k]<rows[i-1][k]) ok=false;
+    if(ok) return k;
+  }}
+  return null;
+}
+function normalizeTimestamp(val){
+  // accept numeric (seconds or ms) or parsable string
+  if(typeof val==='number'){
+    // heuristic: if >1e12 assume ms since epoch, if >1e9 assume s
+    if(val>1e12) return isoUTC(val);
+    if(val>1e9) return isoUTC(val*1000);
+    // small numbers treated as seconds offset from 1970 (unlikely) -> convert to ISO anyway
+    return isoUTC(val*1000);
+  }
+  const d = new Date(String(val)); if(isNaN(d)) return null; return isoUTC(d);
+}
+async function handleFile(file){
+  const name = file.name;
+  if(name.match(/\.zip$/i)){
+    // browser zip handling not available without libs; state limitation
+    return {name, error:'ZIP files are not supported in this prototype. Please unzip and upload contained CSV/JSON files.'};
+  }
+  const text = await file.text();
+  let rows=[]; let sourceType='unknown';
+  try{
+    if(name.match(/\.json$/i)){
+      const parsed = JSON.parse(text);
+      if(Array.isArray(parsed)) rows = parsed; else if(parsed.data && Array.isArray(parsed.data)) rows = parsed.data; else { return {name, error:'JSON file did not contain an array of records at top-level.'}; }
+      sourceType='json';
+    } else if(name.match(/\.csv$/i)){
+      rows = parseCSV(text); sourceType='csv';
+    } else {
+      return {name, error:'Unsupported extension; upload .csv or .json files.'};
+    }
+  }catch(e){ return {name, error:'Parse error: '+e.message}; }
+  if(!rows.length) return {name, error:'No records found.'};
+  const timeField = detectTimeField(rows);
+  if(!timeField) return {name, error:'No timestamp-like field detected.'};
+  // find candidate pose/orientation fields (x,y,z,qx,qy,qz,qw or roll/pitch/yaw)
+  const keys = Object.keys(rows[0]);
+  const poseSets = [];
+  const candidates = [ ['x','y','z'], ['roll','pitch','yaw'], ['qx','qy','qz','qw'] ];
+  for(const cand of candidates){ if(cand.every(c=>keys.some(k=>k.toLowerCase()===c))){ poseSets.push(cand); } }
+  // fallback: take numeric fields excluding time
+  let poseFields = [];
+  if(poseSets.length) poseFields = poseSets[0]; else poseFields = keys.filter(k=>k!==timeField && typeof rows[0][k]!== 'string');
+  // build canonical per-module structure: here we treat entire file as single module unless 'module' field exists
+  const moduleKey = keys.find(k=>/module|id|name/i.test(k));
+  const modules = {};
+  for(const r of rows){ const mod = moduleKey?String(r[moduleKey]):'module_0'; if(!modules[mod]) modules[mod]=[]; modules[mod].push(r); }
+  const results = {};
+  const issues = [];
+  for(const [mod, recs] of Object.entries(modules)){
+    // sort by time
+    recs.sort((a,b)=>{ const ta = a[timeField], tb=b[timeField]; return (ta>tb)?1:(ta<tb?-1:0); });
+    const samples = recs.map(r=>{ return {rawTime:r[timeField], time: normalizeTimestamp(r[timeField]), values: poseFields.reduce((o,k)=>{ o[k]= r[k]!==undefined? (typeof r[k]==='number'? r[k]:Number(r[k]) ): null; return o; },{}) }; });
+    // checks
+    if(samples.some(s=>s.time===null)) issues.push(mod+': some timestamps could not be parsed');
+    // sampling uniformity check
+    const deltas = [];
+    for(let i=1;i<samples.length;i++){ const t1=new Date(samples[i-1].time).getTime(); const t2=new Date(samples[i].time).getTime(); deltas.push(t2-t1); }
+    if(deltas.length){ const mean = deltas.reduce((a,b)=>a+b,0)/deltas.length; const varp = deltas.filter(d=>Math.abs(d-mean)>mean*0.2).length; if(varp>0) issues.push(mod+': non-uniform sampling (variations in dt)'); }
+    // unit heuristic: large coordinate magnitudes
+    for(const k of poseFields){ const vals = recs.map(r=>Number(r[k])).filter(v=>Number.isFinite(v)); if(vals.length && (Math.max(...vals.map(Math.abs))>1e3)) issues.push(mod+`: field ${k} has large values; units may be unclear (mm vs m)'); }
+    results[mod] = {module:mod, sourceFile:name, sourceType, timeField, poseFields, samples};
+  }
+  const provenance = {file:name, parsedAs:sourceType, records:rows.length, detectedTimeField:timeField, moduleKey:moduleKey||null, issues};
+  return {name, provenance, results};
+}
+
+document.getElementById('run').addEventListener('click', async ()=>{
+  const out = document.getElementById('output'); out.textContent='Processing...';
+  const input = document.getElementById('files'); if(!input.files.length){ out.textContent='No files selected.'; return; }
+  const finalBundles = {};
+  const provenanceList = [];
+  for(const f of input.files){ const r = await handleFile(f); if(r.error){ out.textContent += '\nFile '+f.name+': '+r.error; continue; }
+    provenanceList.push(r.provenance);
+    for(const [mod,obj] of Object.entries(r.results)){
+      // create canonical JSON blob per module
+      finalBundles[mod] = obj;
+    }
+  }
+  // present summary and provide download links
+  let txt = 'Processed modules: ' + Object.keys(finalBundles).length + '\n';
+  txt += 'Provenance:\n' + JSON.stringify(provenanceList,null,2) + '\n';
+  for(const [mod,obj] of Object.entries(finalBundles)){
+    const blob = new Blob([JSON.stringify(obj,null,2)],{type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    txt += '\nModule: '+mod+' -> JSON: '; txt += url; // browsers will not make clickable in textarea; user can open console
+    // also create clickable link element
+    const a = document.createElement('a'); a.href = url; a.download = mod + '.canonical.json'; a.textContent = 'Download '+mod;
+    a.style.display='block'; document.getElementById('fileList').appendChild(a);
+  }
+  out.textContent = txt + '\n\nNotes:\n- ZIP handling not implemented in this prototype.\n- This is heuristic parsing for quick inspection; manual review required for coordinate frames and units.';
+});
+</script>
+</body>
+</html>
